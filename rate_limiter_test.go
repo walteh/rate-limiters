@@ -5,6 +5,8 @@ import (
 	"sync"
 	"testing"
 	"time"
+
+	"github.com/stretchr/testify/require"
 )
 
 // TestRateLimiterInterface ensures all implementations satisfy the interface
@@ -213,43 +215,29 @@ func TestTokenBucketRateLimiter(t *testing.T) {
 	// Should allow burst requests initially
 	for i := 0; i < config.Burst; i++ {
 		allowed, err := limiter.Allow(ctx, key)
-		if err != nil {
-			t.Fatalf("Allow failed: %v", err)
-		}
-		if !allowed {
-			t.Fatalf("Burst request %d should be allowed", i+1)
-		}
+		require.NoError(t, err, "Allow should not return error")
+		require.True(t, allowed, "Burst request %d should be allowed", i+1)
 	}
 
 	// Should deny the next request
 	allowed, err := limiter.Allow(ctx, key)
-	if err != nil {
-		t.Fatalf("Allow failed: %v", err)
-	}
-	if allowed {
-		t.Error("Request beyond burst limit should be denied")
-	}
+	require.NoError(t, err, "Allow should not return error")
+	require.False(t, allowed, "Request beyond burst limit should be denied")
 
 	// Wait for tokens to refill
 	time.Sleep(config.Duration + 10*time.Millisecond)
 
 	// Should allow requests again
 	allowed, err = limiter.Allow(ctx, key)
-	if err != nil {
-		t.Fatalf("Allow failed: %v", err)
-	}
-	if !allowed {
-		t.Error("Request should be allowed after tokens refill")
-	}
+	require.NoError(t, err, "Allow should not return error")
+	require.True(t, allowed, "Request should be allowed after tokens refill")
 
 	// Test Wait functionality
 	ctx, cancel := context.WithTimeout(context.Background(), 200*time.Millisecond)
 	defer cancel()
 
 	err = limiter.Wait(ctx, key)
-	if err != nil {
-		t.Errorf("Wait failed: %v", err)
-	}
+	require.NoError(t, err, "Wait should not return error")
 }
 
 func TestSlidingWindowLogRateLimiter(t *testing.T) {

@@ -2,32 +2,68 @@ package ratelimiters
 
 import (
 	"context"
-	"math"
+	"fmt"
 	"sync"
 	"time"
 )
 
 // TokenBucket implements a token bucket rate limiter
 // This allows for burst traffic up to the bucket capacity and smooth rate limiting
+//
+// Algorithm: O(1) time, O(1) memory per key
+// - Mathematical token calculation
+// - Excellent burst handling
+// - Smooth rate limiting
+// - Industry standard approach
+//
+// Visual representation:
+//
+//   ╔═══════════════════════════════════════════════════════════════════╗
+//   ║  Target: 2 requests/second, Burst: 5 tokens                       ║
+//   ║                                                                   ║
+//   ║  Example: Single client making requests at 3 req/s                ║
+//   ║                                                                   ║
+//   ║                 Starting State                   Ending State     ║
+//   ║                  ───────────┐                     ───────────┐    ║
+//   ║ [0s]         ▶  │ ➊ ➋ ➌ ➍ ➎ │  ▶  3 req       ▶  │ ① ② ③ ➍ ➎ │    ║
+//   ║                 └───────────┘     0 blocked      └───────────┘    ║
+//   ║                                                                   ║
+//   ║                  ───────────┐                     ───────────┐    ║
+//   ║ [1s]  add 2  ▶  │ ➊ ➋ ③ ➍ ➎ │  ▶  3 req       ▶  │ ① ② ③ ④ ➎ │    ║
+//   ║                 └───────────┘     0 blocked      └───────────┘    ║
+//   ║                                                                   ║
+//   ║                  ───────────┐                     ───────────┐    ║
+//   ║ [2s]  add 2  ▶  │ ➊ ➋ ③ ④ ➎ │  ▶  3 req       ▶  │ ① ② ③ ④ ⑤ │    ║
+//   ║                 └───────────┘     0 blocked      └───────────┘    ║
+//   ║                                                                   ║
+//   ║                  ───────────┐                     ───────────┐    ║
+//   ║ [3s]  add 2  ▶  │ ➊ ➋ ③ ④ ⑤ │  ▶  3 req       ▶  │ ① ② ③ ④ ⑤ │    ║
+//   ║                 └───────────┘     1 blocked      └───────────┘    ║
+//   ║                                                                   ║
+//   ╚═══════════════════════════════════════════════════════════════════╝
+
 type TokenBucket struct {
-	config   Config
 	mu       sync.RWMutex
 	buckets  map[string]*bucketState
 	stopChan chan struct{}
 	closed   bool
+
+	nanosecondRefillInterval uint64
+	bucketSize               uint64
 }
 
 type bucketState struct {
-	tokens   float64
-	lastFill time.Time
+	availableTokens uint64
+	lastFill        time.Time
 }
 
 // NewTokenBucket creates a new token bucket rate limiter
 func NewTokenBucket(config Config) *TokenBucket {
 	tb := &TokenBucket{
-		config:   config,
-		buckets:  make(map[string]*bucketState),
-		stopChan: make(chan struct{}),
+		buckets:                  make(map[string]*bucketState),
+		bucketSize:               uint64(max(config.Burst, config.Rate)),
+		stopChan:                 make(chan struct{}),
+		nanosecondRefillInterval: uint64(float64(config.Duration.Nanoseconds()) / float64(config.Rate)),
 	}
 
 	// Start cleanup goroutine
@@ -49,14 +85,14 @@ func (tb *TokenBucket) AllowN(ctx context.Context, key string, n int) (bool, err
 	defer tb.mu.Unlock()
 
 	if tb.closed {
-		return false, ErrNotSupported{Operation: "AllowN", Limiter: "TokenBucket (closed)"}
+		return false, errorClosed()
 	}
 
 	now := time.Now()
-	bucket := tb.getBucket(key, now)
+	availableTokens := tb.refreshAvailableTokens(key, now)
 
-	if bucket.tokens >= float64(n) {
-		bucket.tokens -= float64(n)
+	if availableTokens >= uint64(n) {
+		tb.consumeAvailableTokens(key, n)
 		return true, nil
 	}
 
@@ -72,27 +108,30 @@ func (tb *TokenBucket) WaitN(ctx context.Context, key string, n int) error {
 		return nil
 	}
 
+	if n > int(tb.bucketSize) {
+		return fmt.Errorf("too many tokens requested: %d > %d", n, tb.bucketSize)
+	}
+
 	for {
 		// Try to get tokens
 		tb.mu.Lock()
 		if tb.closed {
 			tb.mu.Unlock()
-			return ErrNotSupported{Operation: "WaitN", Limiter: "TokenBucket (closed)"}
+			return errorClosed()
 		}
 
 		now := time.Now()
-		bucket := tb.getBucket(key, now)
+		availableTokens := tb.refreshAvailableTokens(key, now)
 
-		if bucket.tokens >= float64(n) {
-			bucket.tokens -= float64(n)
+		if availableTokens >= uint64(n) {
+			tb.consumeAvailableTokens(key, n)
 			tb.mu.Unlock()
 			return nil
 		}
 
 		// Calculate how long to wait for enough tokens
-		tokensNeeded := float64(n) - bucket.tokens
-		refillRate := float64(tb.config.Rate) / tb.config.Duration.Seconds()
-		waitDuration := time.Duration(tokensNeeded/refillRate*1000) * time.Millisecond
+		tokensNeeded := uint64(n) - availableTokens
+		waitDuration := time.Duration(tokensNeeded * tb.nanosecondRefillInterval)
 
 		tb.mu.Unlock()
 
@@ -114,7 +153,7 @@ func (tb *TokenBucket) Reset(ctx context.Context, key string) error {
 	defer tb.mu.Unlock()
 
 	if tb.closed {
-		return ErrNotSupported{Operation: "Reset", Limiter: "TokenBucket (closed)"}
+		return errorClosed()
 	}
 
 	delete(tb.buckets, key)
@@ -137,42 +176,31 @@ func (tb *TokenBucket) String() string {
 	return "TokenBucket"
 }
 
-// getBucket gets or creates a bucket for the given key and updates its tokens
-// Must be called with lock held
-func (tb *TokenBucket) getBucket(key string, now time.Time) *bucketState {
+func (tb *TokenBucket) consumeAvailableTokens(key string, n int) {
+	tb.buckets[key].availableTokens -= uint64(n)
+}
+
+func (tb *TokenBucket) refreshAvailableTokens(key string, now time.Time) uint64 {
 	bucket, exists := tb.buckets[key]
 	if !exists {
-		bucket = &bucketState{
-			tokens:   float64(tb.getBurstSize()),
-			lastFill: now,
-		}
+		bucket = &bucketState{availableTokens: tb.bucketSize, lastFill: now}
 		tb.buckets[key] = bucket
-		return bucket
 	}
 
 	// Refill tokens based on time elapsed
 	elapsed := now.Sub(bucket.lastFill)
 	if elapsed > 0 {
-		refillRate := float64(tb.config.Rate) / tb.config.Duration.Seconds()
-		tokensToAdd := refillRate * elapsed.Seconds()
-		bucket.tokens = math.Min(bucket.tokens+tokensToAdd, float64(tb.getBurstSize()))
+		tokensToAdd := uint64(elapsed.Nanoseconds()) / tb.nanosecondRefillInterval
+		bucket.availableTokens = min(bucket.availableTokens+tokensToAdd, tb.bucketSize)
 		bucket.lastFill = now
 	}
 
-	return bucket
-}
-
-// getBurstSize returns the burst size, using config.Burst if set, otherwise config.Rate
-func (tb *TokenBucket) getBurstSize() int {
-	if tb.config.Burst > 0 {
-		return tb.config.Burst
-	}
-	return tb.config.Rate
+	return bucket.availableTokens
 }
 
 // cleanup removes unused buckets periodically
 func (tb *TokenBucket) cleanup() {
-	ticker := time.NewTicker(tb.config.Duration * 2) // Clean up every 2 windows
+	ticker := time.NewTicker(time.Duration(tb.nanosecondRefillInterval) * 2) // Clean up every 2 windows
 	defer ticker.Stop()
 
 	for {
@@ -181,7 +209,7 @@ func (tb *TokenBucket) cleanup() {
 			return
 		case now := <-ticker.C:
 			tb.mu.Lock()
-			cutoff := now.Add(-tb.config.Duration * 5) // Remove buckets unused for 5 windows
+			cutoff := now.Add(-time.Duration(tb.nanosecondRefillInterval) * 5) // Remove buckets unused for 5 windows
 
 			for key, bucket := range tb.buckets {
 				if bucket.lastFill.Before(cutoff) {

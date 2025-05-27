@@ -2,6 +2,8 @@ package ratelimiters
 
 import (
 	"context"
+	"runtime"
+	"strings"
 	"time"
 )
 
@@ -49,6 +51,14 @@ type ErrNotSupported struct {
 	Limiter   string
 }
 
+type ErrClosed struct {
+	Limiter string
+}
+
+func (e ErrClosed) Error() string {
+	return "rate limiter " + e.Limiter + " is closed"
+}
+
 func (e ErrNotSupported) Error() string {
 	return "operation " + e.Operation + " not supported by " + e.Limiter + " rate limiter"
 }
@@ -61,4 +71,21 @@ type ErrRateLimited struct {
 
 func (e ErrRateLimited) Error() string {
 	return "rate limited for key: " + e.Key
+}
+
+// notSupported uses the caller to automatically generate a nice error message for the caller
+func errorNotSupported() error {
+	ptr, _, _, _ := runtime.Caller(1)
+	funcName := runtime.FuncForPC(ptr).Name()
+	structName := strings.Split(funcName, ".")[1]
+	methodName := strings.Split(funcName, ".")[2]
+	return ErrNotSupported{Operation: methodName, Limiter: structName}
+}
+
+// closed uses the caller to automatically generate a nice error message for the caller
+func errorClosed() error {
+	ptr, _, _, _ := runtime.Caller(1)
+	funcName := runtime.FuncForPC(ptr).Name()
+	structName := strings.Split(funcName, ".")[1]
+	return ErrClosed{Limiter: structName}
 }
