@@ -8,6 +8,49 @@ import (
 
 // SlidingWindowLog implements a sliding window rate limiter using a more efficient log structure
 // This is similar to SlidingWindow but uses a circular buffer for better memory efficiency
+//
+// Algorithm: O(n) time, O(1) memory per key (pre-allocated)
+// - Circular buffer optimization
+// - Memory efficient vs SlidingWindow
+// - Still O(n) cleanup but better constants
+// - Good compromise between accuracy and efficiency
+//
+// Visual representation:
+//
+//   ╔═══════════════════════════════════════════════════════════╗
+//   ║              SLIDING WINDOW LOG LIMITER                   ║
+//   ╠═══════════════════════════════════════════════════════════╣
+//   ║  Rate Limit: 5 requests per 10 seconds                    ║
+//   ║  Circular Buffer Size: 10 (2x rate limit)                 ║
+//   ║                                                           ║
+//   ║  Initial State - Circular Buffer:                         ║
+//   ║  ┌───┬───┬───┬───┬───┬───┬───┬───┬───┬───┐                ║
+//   ║  │➊s │➌s │➐s│➒s│① │① │① │① │① │① │                ║
+//   ║  └───┴───┴───┴───┴───┴───┴───┴───┴───┴───┘                ║
+//   ║    ▲               ▲                                      ║
+//   ║   head           tail                                     ║
+//   ║  (oldest)      (newest)                                   ║
+//   ║                                                           ║
+//   ║  Current Time: 10s, Window: [0s → 10s]                    ║
+//   ║  Valid Requests: 4 (✓1s, ✓3s, ✓7s, ✓9s)                  ║
+//   ║                                                           ║
+//   ║  New request at 10s:                                      ║
+//   ║  ┌───┬───┬───┬───┬───┬───┬───┬───┬───┬───┐                ║
+//   ║  │➊s │➌s │➐s│➒s│⑩s│① │① │① │① │① │                ║
+//   ║  └───┴───┴───┴───┴───┴───┴───┴───┴───┴───┘                ║
+//   ║    ▲                   ▲                                  ║
+//   ║   head               tail                                 ║
+//   ║                                                           ║
+//   ║  At time 1s+10s, window slides: [1s → 1s+10s]             ║
+//   ║  Cleanup removes 1s (expired):                            ║
+//   ║  ┌───┬───┬───┬───┬───┬───┬───┬───┬───┬───┐                ║
+//   ║  │① │➌s │➐s│➒s│⑩s│① │① │① │① │① │                ║
+//   ║  └───┴───┴───┴───┴───┴───┴───┴───┴───┴───┘                ║
+//   ║        ▲               ▲                                  ║
+//   ║       head           tail                                 ║
+//   ║                                                           ║
+//   ╚═══════════════════════════════════════════════════════════╝
+
 type SlidingWindowLog struct {
 	config   Config
 	mu       sync.RWMutex
@@ -152,7 +195,7 @@ func (swl *SlidingWindowLog) Reset(ctx context.Context, key string) error {
 	defer swl.mu.Unlock()
 
 	if swl.closed {
-		return ErrNotSupported{Operation: "Reset", Limiter: "SlidingWindowLog (closed)"}
+		return errorClosed()
 	}
 
 	delete(swl.windows, key)

@@ -8,6 +8,43 @@ import (
 
 // SlidingWindow implements a sliding window rate limiter
 // This tracks individual request timestamps and provides more accurate rate limiting
+//
+// Algorithm: O(n) time, O(n) memory per key
+// - Stores every request timestamp
+// - Perfect accuracy, no boundary attacks
+// - High memory usage for busy keys
+// - Expensive cleanup operations
+//
+// Visual representation:
+//
+//   ╔═══════════════════════════════════════════════════════════╗
+//   ║                 SLIDING WINDOW LIMITER                    ║
+//   ╠═══════════════════════════════════════════════════════════╣
+//   ║  Rate Limit: 5 requests per 10 seconds                    ║
+//   ║                                                           ║
+//   ║  Current Time: 10s                                        ║
+//   ║  Window: [0s ←────────── 10s ──────────→ 10s]             ║
+//   ║                                                           ║
+//   ║  Stored Timestamps: [1s, 3s, 7s, 9s]                      ║
+//   ║                                                           ║
+//   ║  Timeline:                                                ║
+//   ║  0s   1s   2s   3s   4s   5s   6s   7s   8s   9s   10s    ║
+//   ║  ┊    ➊    ┊    ➌    ┊    ┊    ┊    ➐    ┊    ➒    ┊      ║
+//   ║  ┊    ✓    ┊    ✓    ┊    ┊    ┊    ✓    ┊    ✓    ┊      ║
+//   ║  └▲───┴────┴────┴────┴────┴────┴────┴────┴────┴────▲┘      ║
+//   ║   │                                                │      ║
+//   ║ Window Start                              Current Time     ║
+//   ║    (0s)                                      (10s)        ║
+//   ║                      Valid Window                         ║
+//   ║                                                           ║
+//   ║  New request at 10s: ✓ (4 + 1 = 5 ≤ limit)                ║
+//   ║  Another request: ✗ (5 + 1 = 6 > limit)                   ║
+//   ║                                                           ║
+//   ║  At time 1s+10s, window slides: [1s ←─── 10s ───→ 1s+10s] ║
+//   ║  Timestamp 1s expires, only [3s, 7s, 9s] remain           ║
+//   ║                                                           ║
+//   ╚═══════════════════════════════════════════════════════════╝
+
 type SlidingWindow struct {
 	config   Config
 	mu       sync.RWMutex
@@ -47,7 +84,7 @@ func (sw *SlidingWindow) AllowN(ctx context.Context, key string, n int) (bool, e
 	defer sw.mu.Unlock()
 
 	if sw.closed {
-		return false, ErrNotSupported{Operation: "AllowN", Limiter: "SlidingWindow (closed)"}
+		return false, errorNotSupported()
 	}
 
 	now := time.Now()
@@ -152,7 +189,7 @@ func (sw *SlidingWindow) Reset(ctx context.Context, key string) error {
 	defer sw.mu.Unlock()
 
 	if sw.closed {
-		return ErrNotSupported{Operation: "Reset", Limiter: "SlidingWindow (closed)"}
+		return errorClosed()
 	}
 
 	delete(sw.windows, key)

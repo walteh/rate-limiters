@@ -8,6 +8,28 @@ import (
 
 // FixedWindow implements a naive fixed window rate limiter
 // This is the simplest approach but has issues with burst traffic at window boundaries
+//
+// Algorithm: O(1) time, O(1) memory per key
+// - Time-based window reset
+// - Vulnerable to boundary attacks
+// - Simple but flawed for security
+//
+// Visual representation:
+//
+//   ╔═══════════════════════════════════════════════════════════╗
+//   ║  Target: 3 requests per 5 seconds                         ║
+//   ║                                                           ║
+//   ║  Naive Usage (3 requests in 5 seconds):                   ║
+//   ║  ┌─────────────────────┐                                  ║
+//   ║  │ ⓿ ➊ ➋ ③ ④┊➎ ➏ ➐ ⑧ ⑨ │                                  ║
+//   ║  └─────────────────────┘                                  ║
+//   ║                                                           ║
+//   ║  Problematic Usage (4 requests in 5 seconds):             ║
+//   ║  ┌─────────────────────┐                                  ║
+//   ║  │ ⓿ ➊ ② ③ ➍┊➎ ➏ ➐ ⑧ ⑨ │                                  ║
+//   ║  └─────────────────────┘                                  ║
+//   ╚═══════════════════════════════════════════════════════════╝
+
 type FixedWindow struct {
 	config   Config
 	mu       sync.RWMutex
@@ -48,7 +70,7 @@ func (fw *FixedWindow) AllowN(ctx context.Context, key string, n int) (bool, err
 	defer fw.mu.Unlock()
 
 	if fw.closed {
-		return false, ErrNotSupported{Operation: "AllowN", Limiter: "FixedWindow (closed)"}
+		return false, errorNotSupported()
 	}
 
 	now := time.Now()
@@ -74,11 +96,11 @@ func (fw *FixedWindow) AllowN(ctx context.Context, key string, n int) (bool, err
 }
 
 func (fw *FixedWindow) Wait(ctx context.Context, key string) error {
-	return ErrNotSupported{Operation: "Wait", Limiter: "FixedWindow"}
+	return errorNotSupported()
 }
 
 func (fw *FixedWindow) WaitN(ctx context.Context, key string, n int) error {
-	return ErrNotSupported{Operation: "WaitN", Limiter: "FixedWindow"}
+	return errorNotSupported()
 }
 
 func (fw *FixedWindow) Reset(ctx context.Context, key string) error {
@@ -86,7 +108,7 @@ func (fw *FixedWindow) Reset(ctx context.Context, key string) error {
 	defer fw.mu.Unlock()
 
 	if fw.closed {
-		return ErrNotSupported{Operation: "Reset", Limiter: "FixedWindow (closed)"}
+		return errorNotSupported()
 	}
 
 	delete(fw.windows, key)
